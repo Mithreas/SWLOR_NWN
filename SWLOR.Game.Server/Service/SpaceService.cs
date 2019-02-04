@@ -1347,14 +1347,10 @@ namespace SWLOR.Game.Server.Service
             _.ApplyEffectToObject(DURATION_TYPE_PERMANENT, _.EffectDamageImmunityIncrease(DAMAGE_TYPE_BLUDGEONING, 100), creature);
         }
 
-        public void OnCreatureHeartbeat(NWCreature creature)
+        private void ShootValidTarget(NWCreature creature)
         {
-            // Only do things for armed ships. 
-            if (creature.IsDead) return;
             ShipStats stats = GetShipStatsByAppearance(_.GetAppearanceType(creature));
-            if (stats.scale == default(float)) return;
-            if (creature.GetLocalInt("WEAPONS") == 0) return;
-            
+
             // Fire weapons.
             bool hasGunner = false;
             int shape = SHAPE_SPELLCYLINDER;
@@ -1367,11 +1363,13 @@ namespace SWLOR.Game.Server.Service
 
             // If we have a gunner, we can fire in any direction.  If we don't, we can only fire in front of us. 
             NWArea area = creature.GetLocalObject("AREA");
-            if ((area.IsValid && ((NWObject)area.GetLocalObject("GUNNER")).IsValid) || creature.GetLocalInt("HAS_GUNNER") > 0)                
+            if ((area.IsValid && ((NWObject)area.GetLocalObject("GUNNER")).IsValid) || creature.GetLocalInt("HAS_GUNNER") > 0)
             {
                 hasGunner = true;
                 shape = SHAPE_SPHERE;
                 targetLocation = creature.Location;
+
+                // TODO: increase range by gunner's perk level.
             }
 
             NWCreature target = _.GetFirstObjectInShape(shape, range, targetLocation, TRUE, OBJECT_TYPE_CREATURE, creature.Position);
@@ -1379,7 +1377,7 @@ namespace SWLOR.Game.Server.Service
             {
 
                 if (_.GetIsEnemy(target, creature) == TRUE &&
-                    !target.IsDead && 
+                    !target.IsDead &&
                     _.GetDistanceBetween(creature, target) <= range &&
                     !target.HasAnyEffect(EFFECT_TYPE_INVISIBILITY, EFFECT_TYPE_SANCTUARY))
                 {
@@ -1390,6 +1388,22 @@ namespace SWLOR.Game.Server.Service
 
                 target = _.GetNextObjectInShape(shape, range, targetLocation, TRUE, OBJECT_TYPE_CREATURE, creature.Position);
             }
+        }
+
+        public void OnCreatureHeartbeat(NWCreature creature)
+        {
+            // Only do things for armed ships. 
+            if (creature.IsDead) return;
+            ShipStats stats = GetShipStatsByAppearance(_.GetAppearanceType(creature));
+            if (stats.scale == default(float)) return;
+            if (creature.GetLocalInt("WEAPONS") == 0) return;
+
+            // Ships with the ship AI package already have this heartbeat behaviour handled.
+            if (creature.GetLocalString("BEHAVIOUR") == "StarshipBehaviour") return;
+
+            // Shoot twice per round.
+            ShootValidTarget(creature);            
+            _.DelayCommand(3.0f, ()=>{ ShootValidTarget(creature); });
         }
 
         public void OnModuleItemEquipped()
@@ -1432,13 +1446,73 @@ namespace SWLOR.Game.Server.Service
             {
                 _.AssignCommand(creature, () => { _.ClearAllActions(); _.SetFacingPoint(perceived.Position); });
 
-                // 33% chance of immediately firing if within range.
-                if (_.d3() == 3) OnCreatureHeartbeat(creature);
+                // Fire guns. One definite shot...
+                DoSpaceAttack(creature, perceived, creature.GetLocalInt("HAS_GUNNER") == 1);
+
+                // ... and a second shot later in the round if there is still a valid target.  
+                _.DelayCommand(3.0f, () => { ShootValidTarget(creature); });
             }
             else
             {
-                _.AssignCommand(creature, () => { _.ActionMoveToObject(perceived); });
+                _.AssignCommand(creature, () => { _.ActionMoveToObject(perceived, 1, stats.range - 2); });
             }
+        }
+
+        private bool AdjustFacingAndAttack(NWCreature creature)
+        {
+            // If we have an enemy in front of us, process them. 
+            Location targetLocation = _.Location(
+                creature.Area.Object,
+                _biowarePos.GetChangedPosition(creature.Position, 25.0f, creature.Facing),
+                creature.Facing + 180.0f);
+
+            NWCreature enemy = _.GetFirstObjectInShape(SHAPE_SPELLCONE, 25.0f, targetLocation, 1, OBJECT_TYPE_CREATURE);
+
+            while (enemy.IsValid)
+            {
+                if (_.GetIsEnemy(enemy, creature) == 1)
+                {
+                    OnPerception(creature, enemy);
+                    return true;
+                }
+
+                enemy = _.GetNextObjectInShape(SHAPE_SPELLCONE, 25.0f, targetLocation, 1, OBJECT_TYPE_CREATURE);
+            }
+
+            enemy = _.GetNearestCreature(CREATURE_TYPE_REPUTATION, REPUTATION_TYPE_ENEMY, creature);
+
+            if (enemy.IsValid && _.GetDistanceBetween(enemy, creature) < 25.0f)
+            {
+                // We have an enemy but they are not in our front arc.  
+                float facing = _biowarePos.GetRelativeFacing(creature, enemy);
+
+                // Creature facing is, for some reason, based with 0= due east and proceeding counter clockwise.
+                // Convert to clockwise with due north as 0 so that we can compare it. 
+                float myFacing = creature.Facing;
+
+                if (facing > myFacing && facing - myFacing < 180.0f)
+                {
+                    // Increase our facing (i.e. turn left). 
+                    myFacing = creature.Facing + 60.0f;
+                    if (myFacing > 360.0f) myFacing -= 360.0f;
+                }
+                else
+                {
+                    // Decrease our facing (i.e. turn right).
+                    myFacing = creature.Facing - 60.0f;
+                    if (myFacing < 0.0f) myFacing += 360.0f;
+                }
+
+                // Move forward a little way in our new facing.  
+                targetLocation = _.Location(
+                  creature.Area.Object,
+                  _biowarePos.GetChangedPosition(creature.Position, 5.0f, myFacing),
+                  myFacing + 180.0f);
+
+                _.AssignCommand(creature, () => { _.ActionMoveToLocation(targetLocation, 1); });
+            }
+
+            return false;
         }
 
         // Note - this method is called by the ship behaviour method.  It's different from the generic
@@ -1446,14 +1520,21 @@ namespace SWLOR.Game.Server.Service
         // use different AI. 
         public void OnHeartbeat(NWCreature creature)
         {
-            // Turn to face the nearest enemy if they are within range.
-            // Really ought to improve this a bunch to do proper dogfighting but it will do for now.
             ShipStats stats = GetShipStatsByAppearance(_.GetAppearanceType(creature));
             if (stats.scale == default(float)) return;
 
-            NWCreature enemy = _.GetNearestCreature(CREATURE_TYPE_REPUTATION, REPUTATION_TYPE_ENEMY, creature);
-
-            if (enemy.IsValid) OnPerception(creature, enemy);            
+            // Turn to face the nearest enemy if they are within range.
+            if (AdjustFacingAndAttack(creature))
+            {
+                // Target in range and arc. Check again half way through the round. 
+                _.DelayCommand(3.0f, () => { AdjustFacingAndAttack(creature); });
+            }
+            else
+            {
+                // Target not in range, turn!
+                _.DelayCommand(2.0f, () => { AdjustFacingAndAttack(creature); });
+                _.DelayCommand(4.0f, () => { AdjustFacingAndAttack(creature); });
+            }
         }
     }
 }
