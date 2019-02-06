@@ -29,6 +29,7 @@ namespace SWLOR.Game.Server.Service
         private readonly ILootService _loot;
         private readonly INWNXChat _nwnxChat;
         private readonly INWNXCreature _nwnxCreature;
+        private readonly IPerkService _perk;
         private readonly IPlayerService _player;
         private readonly IPlayerStatService _playerStat;
         private readonly ISerializationService _serialization;
@@ -44,6 +45,7 @@ namespace SWLOR.Game.Server.Service
                             ILootService loot,
                             INWNXChat nwnxChat,
                             INWNXCreature nwnxCreature,
+                            IPerkService perk,
                             IPlayerService player,
                             IPlayerStatService playerStat,
                             ISerializationService serial,
@@ -56,6 +58,7 @@ namespace SWLOR.Game.Server.Service
             _loot = loot;
             _nwnxChat = nwnxChat;
             _nwnxCreature = nwnxCreature;
+            _perk = perk;
             _perm = perm;
             _player = player;
             _playerStat = playerStat;
@@ -408,26 +411,34 @@ namespace SWLOR.Game.Server.Service
             PCBase pcBase = _data.Single<PCBase>(x => x.ID == structure.PCBaseID);
             NWPlaceable bay = GetCargoBay(area, null);
 
-            ship.SetLocalInt("WEAPONS", stats.weapons + GetCargoBonus(bay, 0));
-            ship.SetLocalInt("SHIELDS", stats.shields + GetCargoBonus(bay, 1));
-            ship.SetLocalInt("STEALTH", stats.stealth + GetCargoBonus(bay, 2));
-            ship.SetLocalInt("SCANNING", stats.scanning + GetCargoBonus(bay, 3));
-            ship.SetLocalInt("SPEED", stats.speed + GetCargoBonus(bay, 4));
+            ship.SetLocalInt("WEAPONS", stats.weapons + GetCargoBonus(bay, (int)CustomItemPropertyType.StarshipWeaponsBonus));
+            ship.SetLocalInt("SHIELDS", stats.shields + GetCargoBonus(bay, (int)CustomItemPropertyType.StarshipShieldsBonus));
+            ship.SetLocalInt("STEALTH", stats.stealth + GetCargoBonus(bay, (int)CustomItemPropertyType.StarshipStealthBonus));
+            ship.SetLocalInt("SCANNING", stats.scanning + GetCargoBonus(bay, (int)CustomItemPropertyType.StarshipScanningBonus));
+            ship.SetLocalInt("SPEED", stats.speed + 25 * GetCargoBonus(bay, (int)CustomItemPropertyType.StarshipSpeedBonus));
             ship.SetLocalInt("STRONIDIUM", pcBase.ReinforcedFuel);
             ship.SetLocalInt("HP", (int) structure.Durability);
-            ship.SetLocalFloat("RANGE", stats.range + GetCargoBonus(bay, 5));
+            ship.SetLocalFloat("RANGE", stats.range + GetCargoBonus(bay, (int)CustomItemPropertyType.StarshipRangeBonus));
         }
 
-        private int GetCargoBonus (NWPlaceable bay, int Stat)
-        { 
+        public int GetCargoBonus(NWPlaceable bay, int stat)
+        {
+            int bonus = 0;
+
             // Get the starship's cargo inventory and look for enhancement items. 
             foreach (var item in bay.InventoryItems)
             {
                 // Find any items with the right properties to improve starship abilities.
-                // TODO
+                ItemProperty prop = _.GetFirstItemProperty(item);
+
+                while (_.GetIsItemPropertyValid(prop) == 1)
+                {
+                    if (_.GetItemPropertyType(prop) == stat) bonus += _.GetItemPropertyCostTableValue(prop);
+                    prop = _.GetNextItemProperty(item);
+                }
             }
 
-            return 0;
+            return bonus;
         }
 
         public void SetShipLocation(NWArea area, string location)
@@ -589,7 +600,7 @@ namespace SWLOR.Game.Server.Service
             return landingSpots;
         }
 
-        public bool DoPilotingSkillCheck(NWPlayer player, int DC)
+        public bool DoPilotingSkillCheck(NWPlayer player, int DC, bool reRollIfFailed = false)
         {
             // Get the player's piloting skill (including gear bonuses).
             if (!player.IsPlayer) return false;
@@ -602,7 +613,8 @@ namespace SWLOR.Game.Server.Service
 
             rank += effectiveStats.Piloting;
 
-            if (_.d100() <= (100 * rank) / (rank + DC))
+            if (_.d100() <= (100 * rank) / (rank + DC) ||
+                (reRollIfFailed && _.d100() <= (100 * rank) / (rank + DC)))
             {
                 // Success!
                 _skill.GiveSkillXP(player, SkillType.Piloting, (int)xp);
@@ -729,7 +741,8 @@ namespace SWLOR.Game.Server.Service
 
             int shipAppearance = GetPCShipAppearanceByStyleID((int) shipBase.BuildingStyleID);
 
-            int shipSpeed = GetShipStatsByAppearance(shipAppearance).speed + GetCargoBonus(GetCargoBay(ship, null), 4);
+            int shipSpeed = GetShipStatsByAppearance(shipAppearance).speed + 
+                            25 * GetCargoBonus(GetCargoBay(ship, null), (int)CustomItemPropertyType.StarshipSpeedBonus);
 
             NWPlaceable chair = _.GetNearestObjectByTag("pilot_chair", player);
             ClonePCAndSit(player, chair);
@@ -749,8 +762,9 @@ namespace SWLOR.Game.Server.Service
             player.AssignCommand(() => { _.ActionUnequipItem(player.LeftHand); });
             player.AssignCommand(() => { _.ActionUnequipItem(player.RightHand); });
 
-            // Set the player's movement speed. 
-            shipSpeed += _skill.GetPCSkillRank(player, SkillType.Piloting) + _playerStat.GetPlayerItemEffectiveStats(player).Piloting;
+            // Set the player's movement speed, improved by their skill and the Racer perk. 
+            shipSpeed += _skill.GetPCSkillRank(player, SkillType.Piloting) + _playerStat.GetPlayerItemEffectiveStats(player).Piloting +
+                            10 * _perk.GetPCPerkLevel(player, PerkType.Racer);
             if (shipSpeed > 100)
             {
                 _.ApplyEffectToObject(DURATION_TYPE_PERMANENT, _.EffectMovementSpeedIncrease(shipSpeed - 100), player);
@@ -1016,12 +1030,22 @@ namespace SWLOR.Game.Server.Service
 
             foreach (var encounter in encounters)
             {
-                _error.Trace(SPACE, "Found encounter: " + encounter.Type);
+                _error.Trace(SPACE, "Found encounter: " + encounter.Type + " with base chance " + encounter.Chance);
+
+                if (encounter.Type == 1 || encounter.Type == 4)
+                {
+                    encounter.Chance += _perk.GetPCPerkLevel(player, PerkType.Hunter);
+                    encounter.Chance -= _perk.GetPCPerkLevel(player, PerkType.Sneak);
+                }
+                else if (encounter.Type == 3)
+                {
+                    encounter.Chance += _perk.GetPCPerkLevel(player, PerkType.Scavenger);
+                }
+
+                if (encounter.Chance < 1) encounter.Chance = 1;
+                _error.Trace(SPACE, "Modified chance: " + encounter.Chance);
+
                 totalChance += encounter.Chance;
-                // TODO - add perks here to alter the chance.
-                // Hunter - increase chance of pirates
-                // Sneak - decrease chance of pirates
-                // Scavenger - increase chance of salvage
             }
 
             int random = _.Random(totalChance - 1);
@@ -1037,6 +1061,7 @@ namespace SWLOR.Game.Server.Service
                         string resref = _.d2() == 1 ? "pirate_fighter_1" : "pirate_fighter_2";
                         NWCreature pirate = _.CreateObject(OBJECT_TYPE_CREATURE, resref, trigger.Location);
                         pirate.SetLocalInt("DC", encounter.Difficulty);
+                        pirate.SetLocalInt("LOOT_TABLE_ID", encounter.LootTable);
                         // TODO - play proximity alert sound.
                     }
                     else if (encounter.Type == 2)
@@ -1173,12 +1198,14 @@ namespace SWLOR.Game.Server.Service
                 pcGunner = attackerArea.GetLocalObject("GUNNER");
                 EffectiveItemStats effectiveStats = _playerStat.GetPlayerItemEffectiveStats(pcGunner);
                 attackerPiloting += _skill.GetPCSkillRank(pcGunner, SkillType.Piloting) + effectiveStats.Piloting;
+
+                attackerPiloting += 3 * _perk.GetPCPerkLevel(pcGunner, PerkType.CrackShot);
             }
 
             if (attacker.IsPC)
             {
                 EffectiveItemStats effectiveStats = _playerStat.GetPlayerItemEffectiveStats(new NWPlayer(attacker));
-                attackerPiloting += _skill.GetPCSkillRank(new NWPlayer(attacker), SkillType.Piloting) + effectiveStats.Piloting;
+                attackerPiloting += _skill.GetPCSkillRank(new NWPlayer(attacker), SkillType.Piloting) + effectiveStats.Piloting;                
             }
             else
             {
@@ -1189,6 +1216,8 @@ namespace SWLOR.Game.Server.Service
             {
                 EffectiveItemStats effectiveStats = _playerStat.GetPlayerItemEffectiveStats(new NWPlayer(target));
                 defenderPiloting += _skill.GetPCSkillRank(new NWPlayer(target), SkillType.Piloting) + effectiveStats.Piloting;
+
+                defenderPiloting += 3 * _perk.GetPCPerkLevel(new NWPlayer(target), PerkType.Evasive);
             }
             else
             {
@@ -1227,7 +1256,7 @@ namespace SWLOR.Game.Server.Service
                 defendStron -= defendShields/2;
                 target.SetLocalInt("STRONIDIUM", defendStron);
 
-                // Calculate damage.  TODO - add perks that help here.
+                // Calculate damage. 
                 int overkill = (100 * attackerPiloting) / (attackerPiloting + defenderPiloting) - check; // how much we beat the check by.
                 float bonus = (float)overkill / 100.0f;
                 _error.Trace(SPACE, "Hit! Bonus % damage: " + bonus);
@@ -1249,8 +1278,9 @@ namespace SWLOR.Game.Server.Service
                 {
                     target.SetLocalInt("HP", targetHP);
                     attacker.FloatingText(target.Name + ": " + targetHP + "/" + target.GetLocalInt("MAX_HP"), true);
+                    if (pcGunner.IsValid && !attacker.IsPC) pcGunner.FloatingText(target.Name + ": " + targetHP + "/" + target.GetLocalInt("MAX_HP"), true);
                     target.FloatingText("Hull points: " + targetHP + "/" + target.GetLocalInt("MAX_HP"), true);
-                    if (defenderArea.IsValid && damage > 0) DoImpactFeedback(defenderArea, "Your ship was hit!  Hull points " + (targetHP) + "/" + target.GetLocalInt("MAX_HP"));
+                    if (defenderArea.IsValid && damage > 0) DoImpactFeedback(defenderArea, "Your ship was hit!  Hull points " + targetHP + "/" + target.GetLocalInt("MAX_HP"));
                 }
             }
             else
@@ -1287,9 +1317,32 @@ namespace SWLOR.Game.Server.Service
                 PCBaseStructure structure = _data.Single<PCBaseStructure>(x => x.ID.ToString() == baseStructureID);
                 PCBase pcBase = _data.Single<PCBase>(x => x.ID == structure.PCBaseID);
 
-                pcBase.ReinforcedFuel = attackStron;
-                _data.SubmitDataChange(pcBase, DatabaseActionType.Update);
+                int stronLoss = pcBase.ReinforcedFuel - attackStron;
 
+                if (stronLoss > 1)
+                {
+                    // Look for an engineer on board the ship who can reduce the loss. 
+                    foreach (NWObject obj in attackerArea.Objects)
+                    {
+                        if (obj.IsPC)
+                        {
+                            stronLoss -= _perk.GetPCPerkLevel(new NWPlayer(obj), PerkType.SystemsOptimization);
+                            _error.Trace(SPACE, "Attacker's stronidium loss reduced by engineer, now " + stronLoss);
+
+                            if (stronLoss < 1)
+                            {
+                                stronLoss = 1;
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                if (stronLoss > 0)
+                {
+                    pcBase.ReinforcedFuel = attackStron;
+                    _data.SubmitDataChange(pcBase, DatabaseActionType.Update);
+                }
             }
 
             if (defenderArea.IsValid)
@@ -1298,7 +1351,28 @@ namespace SWLOR.Game.Server.Service
                 PCBaseStructure structure = _data.Single<PCBaseStructure>(x => x.ID.ToString() == baseStructureID);
                 PCBase pcBase = _data.Single<PCBase>(x => x.ID == structure.PCBaseID);
 
-                if (pcBase.ReinforcedFuel != defendStron)
+                int stronLoss = pcBase.ReinforcedFuel - defendStron;
+
+                if (stronLoss > 1)
+                {
+                    // Look for an engineer on board the ship who can reduce the loss. 
+                    foreach (NWObject obj in attackerArea.Objects)
+                    {
+                        if (obj.IsPC)
+                        {
+                            stronLoss -= _perk.GetPCPerkLevel(new NWPlayer(obj), PerkType.SystemsOptimization);
+                            _error.Trace(SPACE, "Defender's stronidium loss reduced by engineer, now " + stronLoss);
+
+                            if (stronLoss < 1)
+                            {
+                                stronLoss = 1;
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                if (stronLoss > 0)
                 {
                     pcBase.ReinforcedFuel = defendStron;
                     _data.SubmitDataChange(pcBase, DatabaseActionType.Update);
@@ -1370,6 +1444,7 @@ namespace SWLOR.Game.Server.Service
                 targetLocation = creature.Location;
 
                 // TODO: increase range by gunner's perk level.
+                range += _perk.GetPCPerkLevel(area.GetLocalObject("GUNNER"), PerkType.Sniper);
             }
 
             NWCreature target = _.GetFirstObjectInShape(shape, range, targetLocation, TRUE, OBJECT_TYPE_CREATURE, creature.Position);
@@ -1412,7 +1487,10 @@ namespace SWLOR.Game.Server.Service
             if (equipper.GetLocalInt("IS_SHIP") > 0)
             {
                 NWItem item = _.GetPCItemLastEquipped();
-                equipper.AssignCommand(() => { _.ClearAllActions(); _.ActionUnequipItem(item); });
+
+                // Using ActionUnequipItem doesn't seem to work.  So copy and destroy.
+                _.CopyItem(item, equipper, 1);
+                item.Destroy();
                 equipper.SendMessage("You cannot equip items while flying a ship.");
             }
         }
@@ -1441,7 +1519,8 @@ namespace SWLOR.Game.Server.Service
 
             if (_.GetIsEnemy(perceived, creature) == 0) return;
 
-            // TODO - respect turning circles and only turn the ship a bit at a time. 
+            // Would be ideal to respect turning circles and only turn the ship a bit at a time. Less urgent now since 
+            // the heartbeat code handles turning. 
             if (_.GetDistanceBetween(creature, perceived) < stats.range)
             {
                 _.AssignCommand(creature, () => { _.ClearAllActions(); _.SetFacingPoint(perceived.Position); });
